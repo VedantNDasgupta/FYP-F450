@@ -1,0 +1,332 @@
+import pybullet as p
+import pybullet_data
+import time
+import math
+import random
+
+# =============================
+# SETUP
+# =============================
+p.connect(p.GUI)
+p.setAdditionalSearchPath(pybullet_data.getDataPath())
+
+p.setGravity(0,0,-9.8)
+p.setRealTimeSimulation(0)
+p.loadSDF("stadium.sdf")
+
+# =============================
+# DRONE
+# =============================
+start_pos = [-20,0,2]
+drone = p.loadURDF("drone.urdf", start_pos)
+p.resetDebugVisualizerCamera(35,45,-40,[0,0,2])
+
+# =============================
+# UI
+# =============================
+phase1_slider = p.addUserDebugParameter("Start Phase 1",0,1,0)
+phase2_slider = p.addUserDebugParameter("Start Phase 2",0,1,0)
+scale_slider = p.addUserDebugParameter("Scale",0.5,3,1)
+pattern_slider = p.addUserDebugParameter("Pattern (0-3)",0,3,0)
+
+# =============================
+# GLOBALS
+# =============================
+wps = []
+buildings = []
+
+phase1 = False
+phase2 = False
+finished_phase1 = False
+
+path = []
+path_i = 0
+
+dt = 1/60
+prev_pos = None
+last_draw = None
+
+phase1_armed = True
+phase2_armed = True
+
+# =============================
+# ENERGY
+# =============================
+energy = 0
+prev_vel = [0,0]
+prev_dir = None
+
+def reset_energy():
+    global energy, prev_vel, prev_dir
+    energy = 0
+    prev_vel = [0,0]
+    prev_dir = None
+
+def update_energy(curr_pos, prev_pos):
+    global energy, prev_vel, prev_dir
+
+    dx = curr_pos[0] - prev_pos[0]
+    dy = curr_pos[1] - prev_pos[1]
+
+    dist = math.sqrt(dx*dx + dy*dy)
+
+    vx = dx/dt
+    vy = dy/dt
+
+    ax = vx - prev_vel[0]
+    ay = vy - prev_vel[1]
+    acc = math.sqrt(ax*ax + ay*ay)
+
+    mag = math.sqrt(vx*vx + vy*vy) + 1e-6
+    dir_unit = [vx/mag, vy/mag]
+
+    turn = 0
+    if prev_dir:
+        dot = dir_unit[0]*prev_dir[0] + dir_unit[1]*prev_dir[1]
+        dot = max(-1,min(1,dot))
+        turn = math.acos(dot)
+
+    energy += dist + 0.08*acc + 0.4*turn
+
+    prev_vel = [vx, vy]
+    prev_dir = dir_unit
+
+# =============================
+# WAYPOINTS
+# =============================
+def generate_waypoints(scale, pattern):
+
+    if pattern == 0:
+        wps = [[-10,12],[10,10],[12,-12],[-12,-10]]
+
+    elif pattern == 1:
+        wps = [[random.uniform(-15,15),random.uniform(-15,15)] for _ in range(4)]
+
+    elif pattern == 2:
+        r = 10
+        wps = [[r*math.cos(i*math.pi/2), r*math.sin(i*math.pi/2)] for i in range(4)]
+
+    else:
+        wps = [[-15+i*10,((-1)**i)*10] for i in range(4)]
+
+    return [[x*scale,y*scale,2] for x,y in wps]
+
+# =============================
+# ORDERING
+# =============================
+def order_waypoints(start, wps):
+
+    cx = sum(w[0] for w in wps)/len(wps)
+    cy = sum(w[1] for w in wps)/len(wps)
+
+    def angle(w):
+        return math.atan2(w[1]-cy, w[0]-cx)
+
+    sorted_wps = sorted(wps, key=angle, reverse=True)
+
+    nearest = min(range(len(sorted_wps)),
+                  key=lambda i: (start[0]-sorted_wps[i][0])**2 + (start[1]-sorted_wps[i][1])**2)
+
+    return sorted_wps[nearest:] + sorted_wps[:nearest]
+
+# =============================
+# BUILDINGS
+# =============================
+def create_buildings(wps):
+    global buildings
+    for b in buildings:
+        p.removeBody(b)
+    buildings=[]
+
+    colors = [[0,1,0,1],[1,0,0,1],[1,1,0,1],[0,0,1,1]]
+
+    for wp,col in zip(wps,colors):
+        vis = p.createVisualShape(p.GEOM_BOX,halfExtents=[1.5]*3,rgbaColor=col)
+        col_shape = p.createCollisionShape(p.GEOM_BOX,halfExtents=[1.5]*3)
+        buildings.append(p.createMultiBody(0,col_shape,vis,[wp[0],wp[1],1.5]))
+
+# =============================
+# PATHS
+# =============================
+def straight_segment(a,b):
+    return [[(1-t)*a[0]+t*b[0],(1-t)*a[1]+t*b[1],2] for t in [i/60 for i in range(60)]]
+
+def build_phase1(start):
+    ordered = order_waypoints(start, wps)
+    pts=[]
+    curr=start
+    for wp in ordered + [start]:
+        pts+=straight_segment(curr,wp)
+        curr=wp
+    return pts
+
+# =============================
+# SPLINE
+# =============================
+def catmull_rom(p0, p1, p2, p3, t):
+    return [
+        0.5*((2*p1[0])+(-p0[0]+p2[0])*t+(2*p0[0]-5*p1[0]+4*p2[0]-p3[0])*t**2+(-p0[0]+3*p1[0]-3*p2[0]+p3[0])*t**3),
+        0.5*((2*p1[1])+(-p0[1]+p2[1])*t+(2*p0[1]-5*p1[1]+4*p2[1]-p3[1])*t**2+(-p0[1]+3*p1[1]-3*p2[1]+p3[1])*t**3),
+        2
+    ]
+
+def build_spline_path(start):
+
+    ordered = order_waypoints(start, wps)
+    pts_ctrl = [start] + ordered + [start]
+    pts_ctrl = [pts_ctrl[0]] + pts_ctrl + [pts_ctrl[-1]]
+
+    pts = []
+
+    for i in range(len(pts_ctrl)-3):
+        p0,p1,p2,p3 = pts_ctrl[i:i+4]
+        for t in [j/50 for j in range(50)]:
+            pts.append(catmull_rom(p0,p1,p2,p3,t))
+
+    return pts
+
+# =============================
+# 🔥 EXPORT TO MISSION PLANNER
+# =============================
+def export_to_waypoints(path):
+
+    base_lat = 19.0222532429611
+    base_lon = 72.8560656309128
+    scale = 1/100000
+
+    sampled = path[::10]
+
+    with open("mission_phase2.waypoints","w") as f:
+
+        f.write("QGC WPL 110\n")
+
+        # HOME
+        f.write(f"0\t1\t0\t16\t0\t0\t0\t0\t{base_lat}\t{base_lon}\t0\t1\n")
+
+        # TAKEOFF
+        f.write(f"1\t0\t3\t22\t0\t0\t0\t0\t{base_lat}\t{base_lon}\t30\t1\n")
+
+        # WAYPOINTS
+        for i,pt in enumerate(sampled, start=2):
+
+            lat = base_lat + pt[1]*scale
+            lon = base_lon + pt[0]*scale
+            alt = 30
+
+            f.write(f"{i}\t0\t3\t16\t0\t0\t0\t0\t{lat}\t{lon}\t{alt}\t1\n")
+
+    print("📡 Exported mission with HOME + TAKEOFF")
+
+# =============================
+# MOVE
+# =============================
+def move(target, speed):
+    pos,_ = p.getBasePositionAndOrientation(drone)
+
+    dx,dy,dz = target[0]-pos[0], target[1]-pos[1], target[2]-pos[2]
+    dist = math.sqrt(dx*dx+dy*dy+dz*dz)
+
+    if dist < 0.3:
+        return True, pos
+
+    step = speed*dt
+    new_pos = [pos[0]+dx/dist*step,pos[1]+dy/dist*step,pos[2]+dz/dist*step]
+
+    p.resetBasePositionAndOrientation(drone,new_pos,[0,0,0,1])
+    return False, new_pos
+
+# =============================
+# DRAW
+# =============================
+def draw(color):
+    global last_draw
+    pos,_ = p.getBasePositionAndOrientation(drone)
+    if last_draw:
+        p.addUserDebugLine(last_draw,pos,color,2,0)
+    last_draw = pos
+
+# =============================
+# MAIN LOOP
+# =============================
+prev_scale=-1
+prev_pattern=-1
+
+while True:
+
+    scale = p.readUserDebugParameter(scale_slider)
+    pattern = int(p.readUserDebugParameter(pattern_slider))
+
+    if abs(scale-prev_scale)>0.01 or pattern!=prev_pattern:
+        wps = generate_waypoints(scale,pattern)
+        create_buildings(wps)
+        prev_scale=scale
+        prev_pattern=pattern
+
+    s1 = p.readUserDebugParameter(phase1_slider)
+    s2 = p.readUserDebugParameter(phase2_slider)
+
+    if s1>0.8 and phase1_armed and not phase1:
+        print("\n🚀 Phase 1 START")
+        phase1=True
+        finished_phase1=False
+        phase1_armed=False
+
+        reset_energy()
+        last_draw=None
+
+        pos,_ = p.getBasePositionAndOrientation(drone)
+        path = build_phase1(pos)
+        path_i=0
+        prev_pos=pos
+
+    if s1<0.2:
+        phase1_armed=True
+
+    if s2>0.8 and phase2_armed and finished_phase1 and not phase2:
+        print("\n⚡ Phase 2 (Spline) START")
+        phase2=True
+        phase2_armed=False
+
+        reset_energy()
+        last_draw=None
+
+        pos,_ = p.getBasePositionAndOrientation(drone)
+        path = build_spline_path(pos)
+        path_i=0
+        prev_pos=pos
+
+    if s2<0.2:
+        phase2_armed=True
+
+    if path_i < len(path):
+
+        reached, curr_pos = move(path[path_i], 5)
+
+        if prev_pos:
+            update_energy(curr_pos, prev_pos)
+
+        prev_pos = curr_pos
+
+        if reached:
+            path_i += 1
+
+        if phase1:
+            draw([1,1,1])
+        elif phase2:
+            draw([0,1,0])
+
+    else:
+        if phase1:
+            print(f"⚡ Energy Phase 1: {energy:.2f}")
+            phase1=False
+            finished_phase1=True
+            p.resetBaseVelocity(drone,[0,0,0],[0,0,0])
+
+        if phase2:
+            print(f"⚡ Energy Phase 2: {energy:.2f}")
+            export_to_waypoints(path)
+            phase2=False
+            p.resetBaseVelocity(drone,[0,0,0],[0,0,0])
+
+    p.stepSimulation()
+    time.sleep(dt)
