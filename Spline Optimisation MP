@@ -1,0 +1,321 @@
+import pybullet as p
+import pybullet_data
+import time
+import math
+import random
+
+# =============================
+# SETUP
+# =============================
+p.connect(p.GUI)
+p.setAdditionalSearchPath(pybullet_data.getDataPath())
+
+p.setGravity(0,0,-9.8)
+p.setRealTimeSimulation(0)
+p.loadSDF("stadium.sdf")
+
+# =============================
+# DRONE
+# =============================
+start_pos = [-20,0,2]
+drone = p.loadURDF("drone.urdf", start_pos)
+p.resetDebugVisualizerCamera(35,45,-40,[0,0,2])
+
+# =============================
+# UI
+# =============================
+auto_slider = p.addUserDebugParameter("AUTO OPTIMIZE",0,1,0)
+scale_slider = p.addUserDebugParameter("Scale",0.5,3,1)
+pattern_slider = p.addUserDebugParameter("Pattern (0-3)",0,3,0)
+
+# =============================
+# GLOBALS
+# =============================
+wps = []
+buildings = []
+
+path = []
+path_i = 0
+
+dt = 1/60
+last_draw = None
+
+auto_armed = True
+running = False
+draw_color = [1,1,1]
+
+# =============================
+# BUILDINGS
+# =============================
+def create_buildings(wps):
+    global buildings
+
+    for b in buildings:
+        p.removeBody(b)
+    buildings = []
+
+    colors = [[0,1,0,1],[1,0,0,1],[1,1,0,1],[0,0,1,1]]
+
+    for wp, col in zip(wps, colors):
+        vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[1.5]*3, rgbaColor=col)
+        col_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[1.5]*3)
+
+        buildings.append(
+            p.createMultiBody(0, col_shape, vis, [wp[0], wp[1], 1.5])
+        )
+
+# =============================
+# METRICS (FINAL MODEL)
+# =============================
+def compute_metrics(path):
+
+    total_dist = 0
+    total_turn = 0
+    prev_dir = None
+
+    for i in range(1,len(path)):
+
+        dx = path[i][0] - path[i-1][0]
+        dy = path[i][1] - path[i-1][1]
+
+        dist = math.sqrt(dx*dx + dy*dy)
+        total_dist += dist
+
+        mag = math.sqrt(dx*dx + dy*dy) + 1e-6
+        dir_unit = [dx/mag, dy/mag]
+
+        if prev_dir:
+            dot = dir_unit[0]*prev_dir[0] + dir_unit[1]*prev_dir[1]
+            dot = max(-1,min(1,dot))
+
+            turn_angle = math.acos(dot)
+            total_turn += turn_angle**2
+
+        prev_dir = dir_unit
+
+    energy = total_dist + 2.0 * total_turn
+
+    return energy, total_dist, total_turn
+
+# =============================
+# WAYPOINTS
+# =============================
+def generate_waypoints(scale, pattern):
+
+    if pattern == 0:
+        wps = [[-10,12],[10,10],[12,-12],[-12,-10]]
+    elif pattern == 1:
+        wps = [[random.uniform(-15,15),random.uniform(-15,15)] for _ in range(4)]
+    elif pattern == 2:
+        r = 10
+        wps = [[r*math.cos(i*math.pi/2), r*math.sin(i*math.pi/2)] for i in range(4)]
+    else:
+        wps = [[-15+i*10,((-1)**i)*10] for i in range(4)]
+
+    return [[x*scale,y*scale,2] for x,y in wps]
+
+# =============================
+# ORDER
+# =============================
+def order_waypoints(start, wps):
+
+    cx = sum(w[0] for w in wps)/len(wps)
+    cy = sum(w[1] for w in wps)/len(wps)
+
+    def angle(w):
+        return math.atan2(w[1]-cy, w[0]-cx)
+
+    sorted_wps = sorted(wps, key=angle, reverse=True)
+
+    nearest = min(range(len(sorted_wps)),
+                  key=lambda i: (start[0]-sorted_wps[i][0])**2 + (start[1]-sorted_wps[i][1])**2)
+
+    return sorted_wps[nearest:] + sorted_wps[:nearest]
+
+# =============================
+# PATHS
+# =============================
+def straight_segment(a,b):
+    return [[(1-t)*a[0]+t*b[0],(1-t)*a[1]+t*b[1],2] for t in [i/60 for i in range(60)]]
+
+def build_phase1(start):
+    ordered = order_waypoints(start, wps)
+    pts=[]
+    curr=start
+    for wp in ordered + [start]:
+        pts+=straight_segment(curr,wp)
+        curr=wp
+    return pts
+
+# =============================
+# SPLINE
+# =============================
+def catmull_rom(p0,p1,p2,p3,t):
+    return [
+        0.5*((2*p1[0])+(-p0[0]+p2[0])*t+(2*p0[0]-5*p1[0]+4*p2[0]-p3[0])*t**2+(-p0[0]+3*p1[0]-3*p2[0]+p3[0])*t**3),
+        0.5*((2*p1[1])+(-p0[1]+p2[1])*t+(2*p0[1]-5*p1[1]+4*p2[1]-p3[1])*t**2+(-p0[1]+3*p1[1]-3*p2[1]+p3[1])*t**3),
+        2
+    ]
+
+def build_spline_path(start):
+
+    ordered = order_waypoints(start, wps)
+    pts_ctrl = [start] + ordered + [start]
+    pts_ctrl = [pts_ctrl[0]] + pts_ctrl + [pts_ctrl[-1]]
+
+    pts = []
+
+    for i in range(len(pts_ctrl)-3):
+        p0,p1,p2,p3 = pts_ctrl[i:i+4]
+
+        segment = []
+        for t in [j/100 for j in range(100)]:
+            segment.append(catmull_rom(p0,p1,p2,p3,t))
+
+        filtered = [segment[0]]
+        min_dist = 0.5
+
+        for pt in segment[1:]:
+            last = filtered[-1]
+            d = math.sqrt((pt[0]-last[0])**2 + (pt[1]-last[1])**2)
+            if d > min_dist:
+                filtered.append(pt)
+
+        pts += filtered
+
+    return pts
+
+# =============================
+# WIND
+# =============================
+def apply_wind(pos):
+    wind_strength = 0.05
+    return [
+        pos[0] + random.uniform(-wind_strength, wind_strength),
+        pos[1] + random.uniform(-wind_strength, wind_strength),
+        pos[2]
+    ]
+
+# =============================
+# MOVE
+# =============================
+def move(target, speed):
+    pos,_ = p.getBasePositionAndOrientation(drone)
+
+    pos = apply_wind(pos)
+
+    dx,dy,dz = target[0]-pos[0], target[1]-pos[1], target[2]-pos[2]
+    dist = math.sqrt(dx*dx+dy*dy+dz*dz)
+
+    if dist < 0.3:
+        return True, pos
+
+    step = speed*dt
+    new_pos = [pos[0]+dx/dist*step,pos[1]+dy/dist*step,pos[2]+dz/dist*step]
+
+    p.resetBasePositionAndOrientation(drone,new_pos,[0,0,0,1])
+    return False, new_pos
+
+# =============================
+# DRAW
+# =============================
+def draw(color):
+    global last_draw
+    pos,_ = p.getBasePositionAndOrientation(drone)
+    if last_draw:
+        p.addUserDebugLine(last_draw,pos,color,2,0)
+    last_draw = pos
+
+# =============================
+# MISSION PLANNER EXPORT
+# =============================
+def export_to_mission_planner(path):
+
+    home_lat = 19.0222532429611
+    home_lon = 72.8560656309128
+
+    scale = 0.00001
+
+    lines = ["QGC WPL 110"]
+
+    # Home waypoint
+    lines.append(f"0\t1\t0\t16\t0\t0\t0\t0\t{home_lat}\t{home_lon}\t10\t1")
+
+    for i, pt in enumerate(path):
+        lat = home_lat + pt[0] * scale
+        lon = home_lon + pt[1] * scale
+
+        lines.append(
+            f"{i+1}\t0\t3\t16\t0\t0\t0\t0\t{lat}\t{lon}\t10\t1"
+        )
+
+    with open("mission.waypoints", "w") as f:
+        f.write("\n".join(lines))
+
+    print("📡 Exported: mission.waypoints")
+
+# =============================
+# MAIN LOOP
+# =============================
+prev_scale=-1
+prev_pattern=-1
+
+while True:
+
+    scale = p.readUserDebugParameter(scale_slider)
+    pattern = int(p.readUserDebugParameter(pattern_slider))
+
+    if abs(scale-prev_scale)>0.01 or pattern!=prev_pattern:
+        wps = generate_waypoints(scale,pattern)
+        create_buildings(wps)
+        prev_scale=scale
+        prev_pattern=pattern
+
+    auto = p.readUserDebugParameter(auto_slider)
+
+    if auto>0.8 and auto_armed and not running:
+
+        print("\n🚀 AUTO OPTIMIZATION START")
+        running=True
+        auto_armed=False
+
+        pos,_ = p.getBasePositionAndOrientation(drone)
+
+        path1 = build_phase1(pos)
+        path2 = build_spline_path(pos)
+
+        e1,d1,t1 = compute_metrics(path1)
+        e2,d2,t2 = compute_metrics(path2)
+
+        print("\n--- METRICS ---")
+        print(f"Phase1 → Energy:{e1:.2f}, Dist:{d1:.2f}, Turn:{t1:.2f}")
+        print(f"Phase2 → Energy:{e2:.2f}, Dist:{d2:.2f}, Turn:{t2:.2f}")
+
+        if e2 < e1:
+            print("✅ Selected: SPLINE PATH")
+            path = path2
+            draw_color = [0,1,0]
+        else:
+            print("⚠️ Selected: STRAIGHT PATH")
+            path = path1
+            draw_color = [1,1,1]
+
+        # 🔥 EXPORT TO MISSION PLANNER
+        export_to_mission_planner(path)
+
+        path_i = 0
+
+    if auto < 0.2:
+        auto_armed = True
+
+    if running and path_i < len(path):
+
+        reached, curr_pos = move(path[path_i], 5)
+
+        if reached:
+            path_i += 1
+
+        draw(draw_color)
+
+    p.stepSimulation()
+    time.sleep(dt)
